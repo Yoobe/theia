@@ -14,244 +14,257 @@
  * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
  ********************************************************************************/
 
-import { injectable, inject, named } from 'inversify';
+// tslint:disable:no-any
+
 import { WebSocketConnectionProvider } from '@theia/core/lib/browser';
-import {
-    DebugAdapterPath,
-    DebugConfiguration,
-    DebugSessionState,
-    DebugSessionStateAccumulator,
-    DebugService
-} from '../common/debug-common';
 import { DebugProtocol } from 'vscode-debugprotocol';
-import { Deferred } from '@theia/core/lib/common/promise-util';
-import {
-    Emitter,
-    Event,
-    DisposableCollection,
-    ContributionProvider,
-    Resource,
-    ResourceResolver,
-    Disposable
-} from '@theia/core';
-import { EventEmitter } from 'events';
-import {
-    DebugSession,
-    DebugSessionFactory,
-    DebugSessionContribution,
-    DEFAULT_STACK_FRAME_FORMAT,
-    INITIALIZE_ARGUMENTS
-} from './debug-model';
-import URI from '@theia/core/lib/common/uri';
-import { BreakpointsApplier } from './breakpoint/breakpoint-applier';
-import { WebSocketChannel } from '@theia/core/lib/common/messaging/web-socket-channel';
-import { NotificationsMessageClient } from '@theia/messages/lib/browser/notifications-message-client';
-import { MessageType } from '@theia/core/lib/common/message-service-protocol';
+import { Emitter, Event, DisposableCollection, Disposable } from '@theia/core';
 import { TerminalService } from '@theia/terminal/lib/browser/base/terminal-service';
+import { EditorManager } from '@theia/editor/lib/browser';
+import { DebugConfiguration } from '../common/debug-common';
+import { DebugSessionConnection, DebugRequestTypes, DebugEventTypes } from './debug-session-connection';
+import { DebugThread, StoppedDetails } from './model/debug-thread';
+import { DebugScope } from './console/debug-console-items';
+import { DebugStackFrame } from './model/debug-stack-frame';
+import { DebugSource } from './model/debug-source';
+import { DebugBreakpoint } from './model/debug-breakpoint';
+import debounce = require('p-debounce');
+import URI from '@theia/core/lib/common/uri';
+import { DebugUtils } from './debug-utils';
+import { BreakpointManager } from './breakpoint/breakpoint-manager';
+
+export enum DebugState {
+    Inactive,
+    Running,
+    Stopped
+}
 
 /**
- * DebugSession implementation.
+ * Initialize requests arguments.
  */
-// FIXME: get rid of Node.js EventEmitter from browser modulde, replace with core Emitter
-export class DebugSessionImpl extends EventEmitter implements DebugSession {
-    protected readonly callbacks = new Map<number, (response: DebugProtocol.Response) => void>();
-    protected readonly connection: Promise<WebSocketChannel>;
+export const INITIALIZE_ARGUMENTS = {
+    clientID: 'Theia',
+    clientName: 'Theia IDE',
+    locale: 'en-US',
+    linesStartAt1: true,
+    columnsStartAt1: true,
+    pathFormat: 'path',
+    supportsVariableType: false,
+    supportsVariablePaging: false,
+    supportsRunInTerminalRequest: true
+};
 
-    protected readonly onDidOutputEmitter = new Emitter<DebugProtocol.OutputEvent>();
-    readonly onDidOutput: Event<DebugProtocol.OutputEvent> = this.onDidOutputEmitter.event;
+// FIXME: make injectable to allow easily inject services
+export class DebugSession {
 
-    protected readonly toDispose = new DisposableCollection(
-        this.onDidOutputEmitter,
-        Disposable.create(() => this.callbacks.clear())
-    );
+    protected readonly connection: DebugSessionConnection;
 
-    private sequence: number;
+    protected readonly onDidChangeEmitter = new Emitter<void>();
+    readonly onDidChange: Event<void> = this.onDidChangeEmitter.event;
+    protected fireDidChange(): void {
+        this.onDidChangeEmitter.fire(undefined);
+    }
+
+    protected readonly onDidChangeBreakpointsEmitter = new Emitter<URI>();
+    readonly onDidChangeBreakpoints: Event<URI> = this.onDidChangeBreakpointsEmitter.event;
+    protected fireDidChangeBreakpoints(uri: URI): void {
+        this.onDidChangeBreakpointsEmitter.fire(uri);
+    }
+
+    protected readonly toDispose = new DisposableCollection();
 
     constructor(
         public readonly sessionId: string,
         public readonly configuration: DebugConfiguration,
-        public readonly state: DebugSessionState,
-        protected readonly connectionProvider: WebSocketConnectionProvider,
-        protected readonly terminalServer: TerminalService
+        connectionProvider: WebSocketConnectionProvider,
+        protected readonly terminalServer: TerminalService,
+        protected readonly editorManager: EditorManager,
+        protected readonly breakpoints: BreakpointManager
     ) {
-        super();
-        this.state = new DebugSessionStateAccumulator(this, state);
-        this.connection = this.createConnection();
-        this.sequence = 1;
+        this.connection = new DebugSessionConnection(sessionId, connectionProvider);
+        this.connection.onRequest('runInTerminal', (request: DebugProtocol.RunInTerminalRequest) => this.runInTerminal(request));
+        this.toDispose.pushAll([
+            this.onDidChangeEmitter,
+            this.onDidChangeBreakpointsEmitter,
+            Disposable.create(() => {
+                this.clearBreakpoints();
+                this.updateThreads([]);
+            }),
+            this.connection,
+            this.on('initialized', () => this.configure()),
+            this.on('continued', ({ body: { allThreadsContinued, threadId } }) => {
+                if (allThreadsContinued !== false) {
+                    this.clearThreads();
+                } else {
+                    this.clearThread(threadId);
+                }
+            }),
+            this.on('stopped', ({ body }) => this.resolveThreads(body)),
+            this.on('thread', ({ body: { reason, threadId } }) => {
+                if (reason === 'started') {
+                    this.resolveThreads(undefined);
+                } else if (reason === 'exited') {
+                    this.clearThread(threadId);
+                }
+            }),
+            this.on('capabilities', event => this.updateCapabilities(event.body.capabilities)),
+            this.breakpoints.onDidChangeMarkers(uri => this.updateBreakpoints({ uri, sourceModified: true }))
+        ]);
     }
 
-    protected createConnection(): Promise<WebSocketChannel> {
-        return new Promise<WebSocketChannel>(resolve =>
-            this.connectionProvider.openChannel(`${DebugAdapterPath}/${this.sessionId}`, channel => {
-                if (this.toDispose.disposed) {
-                    channel.close();
-                } else {
-                    this.toDispose.push(Disposable.create(() => channel.close()));
-                    channel.onMessage(data => this.handleMessage(data));
-                    resolve(channel);
+    dispose(): void {
+        this.toDispose.dispose();
+    }
+
+    // TODO
+    allThreadsContinued = false;
+    // TODO
+    allThreadsStopped = false;
+
+    protected _capabilities: DebugProtocol.Capabilities = {};
+    get capabilities(): DebugProtocol.Capabilities {
+        return this._capabilities;
+    }
+
+    protected readonly sources = new Map<string, DebugSource>();
+    getSource(raw: DebugProtocol.Source): DebugSource {
+        const uri = DebugUtils.toUri(raw).toString();
+        const source = this.sources.get(uri) || new DebugSource(this.connection, this.editorManager);
+        source.update({ raw });
+        this.sources.set(uri, source);
+        return source;
+    }
+    getSourceForUri(uri: URI): DebugSource | undefined {
+        return this.sources.get(uri.toString());
+    }
+    toSource(uri: URI): DebugSource {
+        const source = this.getSourceForUri(uri);
+        if (source) {
+            return source;
+        }
+        const sourceReference = uri.query;
+        if (sourceReference) {
+            return this.getSource({
+                sourceReference: Number.parseInt(sourceReference),
+                name: uri.path.toString()
+            });
+        }
+        return this.getSource({
+            name: uri.displayName,
+            path: uri.path.toString()
+        });
+    }
+
+    protected _threads = new Map<number, DebugThread>();
+    get threads(): IterableIterator<DebugThread> {
+        return this._threads.values();
+    }
+    *getThreads(filter: (thread: DebugThread) => boolean): IterableIterator<DebugThread> {
+        for (const thread of this.threads) {
+            if (filter(thread)) {
+                yield thread;
+            }
+        }
+    }
+    get runningThreads(): IterableIterator<DebugThread> {
+        return this.getThreads(thread => !thread.stopped);
+    }
+    get stoppedThreads(): IterableIterator<DebugThread> {
+        return this.getThreads(thread => thread.stopped);
+    }
+
+    async pauseAll(): Promise<void> {
+        const promises: Promise<void>[] = [];
+        for (const thread of this.runningThreads) {
+            promises.push((async () => {
+                try {
+                    await thread.pause();
+                } catch (e) {
+                    console.error(e);
                 }
-            }, { reconnecting: false })
-        );
+            })());
+        }
+        await Promise.all(promises);
+    }
+
+    async continueAll(): Promise<void> {
+        const promises: Promise<void>[] = [];
+        for (const thread of this.stoppedThreads) {
+            promises.push((async () => {
+                try {
+                    await thread.continue();
+                } catch (e) {
+                    console.error(e);
+                }
+            })());
+        }
+        await Promise.all(promises);
+    }
+
+    get currentFrame(): DebugStackFrame | undefined {
+        return this.currentThread && this.currentThread.currentFrame;
+    }
+
+    protected _currentThread: DebugThread | undefined;
+    get currentThread(): DebugThread | undefined {
+        return this._currentThread;
+    }
+    set currentThread(thread: DebugThread | undefined) {
+        this.setCurrentThread(thread);
+    }
+
+    get state(): DebugState {
+        if (this.connection.disposed) {
+            return DebugState.Inactive;
+        }
+        const thread = this.currentThread;
+        if (thread) {
+            return thread.stopped ? DebugState.Stopped : DebugState.Running;
+        }
+        return !!this.stoppedThreads.next().value ? DebugState.Stopped : DebugState.Running;
+    }
+
+    async resolveScopes(): Promise<DebugScope[]> {
+        const { currentFrame } = this;
+        return currentFrame ? currentFrame.resolveScopes() : [];
     }
 
     async initialize(args: DebugProtocol.InitializeRequestArguments): Promise<DebugProtocol.InitializeResponse> {
-        const response: DebugProtocol.InitializeResponse = await this.sendRequest('initialize', args);
-        this.state.capabilities = response.body || {};
+        const response = await this.connection.sendRequest('initialize', args);
+        this._capabilities = response.body || {};
         return response;
     }
-
-    attach(args: DebugProtocol.AttachRequestArguments): Promise<DebugProtocol.AttachResponse> {
-        return this.sendRequest('attach', args);
+    protected async configure(): Promise<void> {
+        await this.updateBreakpoints({ sourceModified: false });
+        await this.sendRequest('configurationDone', {});
+        await this.resolveThreads(undefined);
     }
 
-    launch(args: DebugProtocol.LaunchRequestArguments): Promise<DebugProtocol.LaunchResponse> {
-        return this.sendRequest('launch', args);
+    async disconnect(args: DebugProtocol.DisconnectArguments = {}): Promise<void> {
+        await this.sendRequest('disconnect', args);
     }
 
-    threads(): Promise<DebugProtocol.ThreadsResponse> {
-        return this.sendRequest('threads');
+    async completions(text: string, column: number, line: number): Promise<DebugProtocol.CompletionItem[]> {
+        const frameId = this.currentFrame && this.currentFrame.raw.id;
+        const response = await this.sendRequest('completions', { frameId, text, column, line });
+        return response.body.targets;
     }
 
-    pauseAll(): Promise<DebugProtocol.PauseResponse[]> {
-        return this.threads().then(response => Promise.all(response.body.threads.map((thread: DebugProtocol.Thread) => this.pause({ threadId: thread.id }))));
+    async evaluate(expression: string, context?: string): Promise<DebugProtocol.EvaluateResponse['body']> {
+        const frameId = this.currentFrame && this.currentFrame.raw.id;
+        const response = await this.sendRequest('evaluate', { expression, frameId, context });
+        return response.body;
     }
 
-    pause(args: DebugProtocol.PauseArguments): Promise<DebugProtocol.PauseResponse> {
-        return this.sendRequest('pause', args);
+    sendRequest<K extends keyof DebugRequestTypes>(command: K, args: DebugRequestTypes[K][0]): Promise<DebugRequestTypes[K][1]> {
+        return this.connection.sendRequest(command, args);
     }
 
-    resumeAll(): Promise<DebugProtocol.ContinueResponse[]> {
-        return this.threads().then(response => Promise.all(response.body.threads.map((thread: DebugProtocol.Thread) => this.resume({ threadId: thread.id }))));
+    on<K extends keyof DebugEventTypes>(kind: K, listener: (e: DebugEventTypes[K]) => any): Disposable {
+        return this.connection.on(kind, listener);
     }
-
-    resume(args: DebugProtocol.ContinueArguments): Promise<DebugProtocol.ContinueResponse> {
-        return this.sendRequest('continue', args);
-    }
-
-    stacks(args: DebugProtocol.StackTraceArguments): Promise<DebugProtocol.StackTraceResponse> {
-        if (!args.format) {
-            args.format = DEFAULT_STACK_FRAME_FORMAT;
-        }
-        return this.sendRequest('stackTrace', args);
-    }
-
-    configurationDone(): Promise<DebugProtocol.ConfigurationDoneResponse> {
-        return this.sendRequest('configurationDone');
-    }
-
-    disconnect(): Promise<DebugProtocol.DisconnectResponse> {
-        return this.sendRequest('disconnect', { terminateDebuggee: true });
-    }
-
-    scopes(args: DebugProtocol.ScopesArguments): Promise<DebugProtocol.ScopesResponse> {
-        return this.sendRequest('scopes', args);
-    }
-
-    variables(args: DebugProtocol.VariablesArguments): Promise<DebugProtocol.VariablesResponse> {
-        return this.sendRequest('variables', args);
-    }
-
-    setVariable(args: DebugProtocol.SetVariableArguments): Promise<DebugProtocol.SetVariableResponse> {
-        return this.sendRequest('setVariable', args);
-    }
-
-    evaluate(args: DebugProtocol.EvaluateArguments): Promise<DebugProtocol.EvaluateResponse> {
-        return this.sendRequest('evaluate', args);
-    }
-
-    source(args: DebugProtocol.SourceArguments): Promise<DebugProtocol.SourceResponse> {
-        return this.sendRequest('source', args);
-    }
-
-    setBreakpoints(args: DebugProtocol.SetBreakpointsArguments): Promise<DebugProtocol.SetBreakpointsResponse> {
-        return this.sendRequest('setBreakpoints', args);
-    }
-
-    next(args: DebugProtocol.NextArguments): Promise<DebugProtocol.NextResponse> {
-        return this.sendRequest('next', args);
-    }
-
-    stepIn(args: DebugProtocol.StepInArguments): Promise<DebugProtocol.StepInResponse> {
-        return this.sendRequest('stepIn', args);
-    }
-
-    stepOut(args: DebugProtocol.StepOutArguments): Promise<DebugProtocol.StepOutResponse> {
-        return this.sendRequest('stepOut', args);
-    }
-
-    loadedSources(args: DebugProtocol.LoadedSourcesRequest): Promise<DebugProtocol.LoadedSourcesResponse> {
-        return this.sendRequest('loadedSources', args);
-    }
-
-    completions(args: DebugProtocol.CompletionsArguments): Promise<DebugProtocol.CompletionsResponse> {
-        return this.sendRequest('completions', args);
-    }
-
-    protected handleMessage(data: string) {
-        const message: DebugProtocol.ProtocolMessage = JSON.parse(data);
-        if (message.type === 'request') {
-            this.handleRequest(message as DebugProtocol.Request);
-        } else if (message.type === 'response') {
-            this.handleResponse(message as DebugProtocol.Response);
-        } else if (message.type === 'event') {
-            this.handleEvent(message as DebugProtocol.Event);
-        }
-    }
-
-    protected async sendRequest<T extends DebugProtocol.Response>(command: string, args?: {}): Promise<T> {
-        const result = new Deferred<T>();
-
-        const request: DebugProtocol.Request = {
-            seq: this.sequence++,
-            type: 'request',
-            command: command,
-            arguments: args
-        };
-
-        this.callbacks.set(request.seq, (response: T) => {
-            if (!response.success) {
-                result.reject(response);
-            } else {
-                result.resolve(response);
-            }
-        });
-
-        await this.send(request);
-        return result.promise;
-    }
-
-    protected async send(message: DebugProtocol.ProtocolMessage): Promise<void> {
-        const connection = await this.connection;
-        connection.send(JSON.stringify(message));
-    }
-
-    protected handleResponse(response: DebugProtocol.Response): void {
-        const callback = this.callbacks.get(response.request_seq);
-        if (callback) {
-            this.callbacks.delete(response.request_seq);
-            callback(response);
-        }
-    }
-
-    protected async handleRequest(request: DebugProtocol.Request): Promise<void> {
-        const response: DebugProtocol.Response = {
-            type: 'response',
-            seq: 0,
-            command: request.command,
-            request_seq: request.seq,
-            success: true,
-        };
-        if (request.command === 'runInTerminal') {
-            try {
-                response.body = await this.runInTerminal(<DebugProtocol.RunInTerminalRequest>request);
-            } catch (err) {
-                response.success = false;
-                response.message = err.message;
-            }
-        } else {
-            console.error('Unhandled request', request);
-        }
-        await this.send(response);
+    onCustom<E extends DebugProtocol.Event>(kind: string, listener: (e: E) => any): Disposable {
+        return this.connection.onCustom(kind, listener);
     }
 
     protected async runInTerminal({ arguments: { title, cwd, args, env } }: DebugProtocol.RunInTerminalRequest): Promise<DebugProtocol.RunInTerminalResponse['body']> {
@@ -261,311 +274,116 @@ export class DebugSessionImpl extends EventEmitter implements DebugSession {
         return { processId };
     }
 
-    protected handleEvent(event: DebugProtocol.Event): void {
-        if (event.event === 'output') {
-            this.onDidOutputEmitter.fire(<DebugProtocol.OutputEvent>event);
+    protected clearThreads(): void {
+        for (const thread of this.threads) {
+            thread.clear();
         }
-        // FIXME: replace with core events
-        this.emit(event.event, event);
-        this.emit('*', event);
+        this.updateCurrentThread();
     }
-
-    protected onClose(): void {
-        if (this.state.isConnected) {
-            const event: DebugProtocol.TerminatedEvent = {
-                event: 'terminated',
-                type: 'event',
-                seq: -1,
-            };
-            this.handleEvent(event);
+    protected clearThread(threadId: number): void {
+        const thread = this._threads.get(threadId);
+        if (thread) {
+            thread.clear();
         }
+        this.updateCurrentThread();
     }
 
-    dispose(): void {
-        this.toDispose.dispose();
+    protected resolveThreads = debounce(async (stoppedDetails: StoppedDetails | undefined) => {
+        const response = await this.sendRequest('threads', {});
+        this.updateThreads(response.body.threads, stoppedDetails);
+    }, 100);
+    protected updateThreads(threads: DebugProtocol.Thread[], stoppedDetails?: StoppedDetails): void {
+        const existing = this._threads;
+        this._threads = new Map();
+        for (const raw of threads) {
+            const id = raw.id;
+            const thread = existing.get(id) || new DebugThread(this);
+            this._threads.set(id, thread);
+            thread.update({
+                raw,
+                stoppedDetails: stoppedDetails && stoppedDetails.threadId === id ? stoppedDetails : undefined
+            });
+        }
+        this.updateCurrentThread(stoppedDetails);
     }
-}
 
-@injectable()
-export class DefaultDebugSessionFactory implements DebugSessionFactory {
-
-    @inject(WebSocketConnectionProvider)
-    protected readonly connectionProvider: WebSocketConnectionProvider;
-
-    @inject(TerminalService)
-    protected readonly terminalService: TerminalService;
-
-    get(sessionId: string, debugConfiguration: DebugConfiguration): DebugSession {
-        const state: DebugSessionState = {
-            isConnected: false,
-            sources: new Map<string, DebugProtocol.Source>(),
-            stoppedThreadIds: new Set<number>(),
-            allThreadsContinued: false,
-            allThreadsStopped: false,
-            capabilities: {}
-        };
-        return new DebugSessionImpl(sessionId, debugConfiguration, state, this.connectionProvider, this.terminalService);
+    protected updateCurrentThread(stoppedDetails?: StoppedDetails): void {
+        const { currentThread } = this;
+        let threadId = currentThread && currentThread.raw.id;
+        if (stoppedDetails && !stoppedDetails.preserveFocusHint && !!stoppedDetails.threadId) {
+            threadId = stoppedDetails.threadId;
+        }
+        this.setCurrentThread(typeof threadId === 'number' && this._threads.get(threadId)
+            || this._threads.values().next().value);
     }
-}
 
-/** It is intended to manage active debug sessions. */
-@injectable()
-export class DebugSessionManager {
-    private activeDebugSessionId: string | undefined;
-
-    protected readonly sessions = new Map<string, DebugSession>();
-    protected readonly contribs = new Map<string, DebugSessionContribution>();
-    protected readonly onDidPreCreateDebugSessionEmitter = new Emitter<string>();
-    protected readonly onDidCreateDebugSessionEmitter = new Emitter<DebugSession>();
-    protected readonly onDidChangeActiveDebugSessionEmitter = new Emitter<[DebugSession | undefined, DebugSession | undefined]>();
-    protected readonly onDidDestroyDebugSessionEmitter = new Emitter<DebugSession>();
-
-    constructor(
-        @inject(DebugSessionFactory) protected readonly debugSessionFactory: DebugSessionFactory,
-        @inject(ContributionProvider) @named(DebugSessionContribution) protected readonly contributions: ContributionProvider<DebugSessionContribution>,
-        @inject(BreakpointsApplier) protected readonly breakpointApplier: BreakpointsApplier,
-        @inject(DebugService) protected readonly debugService: DebugService,
-        @inject(NotificationsMessageClient) protected readonly notification: NotificationsMessageClient) {
-
-        for (const contrib of this.contributions.getContributions()) {
-            this.contribs.set(contrib.debugType, contrib);
+    protected setCurrentThread(thread: DebugThread | undefined): Promise<void> {
+        return this.doSetCurrentThread(thread && thread.stopped ? thread : undefined);
+    }
+    protected readonly toDisposeOnCurrentThread = new DisposableCollection();
+    protected async doSetCurrentThread(thread: DebugThread | undefined): Promise<void> {
+        this.toDisposeOnCurrentThread.dispose();
+        this._currentThread = thread;
+        this.fireDidChange();
+        if (thread) {
+            this.toDisposeOnCurrentThread.push(thread.onDidChanged(() => this.fireDidChange()));
+            await thread.resolve();
         }
     }
 
-    /**
-     * Creates a new [debug session](#DebugSession).
-     * @param sessionId The session identifier
-     * @param configuration The debug configuration
-     * @returns The debug session
-     */
-    async create(sessionId: string, debugConfiguration: DebugConfiguration): Promise<DebugSession> {
-        this.onDidPreCreateDebugSessionEmitter.fire(sessionId);
-
-        const contrib = this.contribs.get(debugConfiguration.type);
-        const sessionFactory = contrib ? contrib.debugSessionFactory() : this.debugSessionFactory;
-        const session = sessionFactory.get(sessionId, debugConfiguration);
-        this.sessions.set(sessionId, session);
-
-        this.onDidCreateDebugSessionEmitter.fire(session);
-
-        session.on('terminated', () => this.destroy(sessionId));
-
-        const initializeArgs: DebugProtocol.InitializeRequestArguments = {
-            ...INITIALIZE_ARGUMENTS,
-            adapterID: debugConfiguration.type
-        };
-
-        session.once('initialized', () => this.onSessionInitialized(session));
-        const request = session.configuration.request;
-
-        switch (request) {
-            case 'attach': {
-                this.attach(session, initializeArgs);
-                break;
-            }
-            case 'launch': {
-                this.launch(session, initializeArgs);
-                break;
-            }
-            default: throw new Error(`Unsupported request '${request}' type.`);
-        }
-
-        return session;
+    protected updateCapabilities(capabilities: DebugProtocol.Capabilities): void {
+        Object.assign(this._capabilities, capabilities);
     }
 
-    private async attach(session: DebugSession, initializeArgs: DebugProtocol.InitializeRequestArguments): Promise<void> {
-        await session.initialize(initializeArgs);
-
-        const attachArgs: DebugProtocol.AttachRequestArguments = Object.assign(session.configuration, { __restart: false });
-        try {
-            await session.attach(attachArgs);
-        } catch (cause) {
-            this.onSessionInitializationFailed(session, cause as DebugProtocol.Response);
-            throw cause;
+    protected readonly _breakpoints = new Map<string, DebugBreakpoint[]>();
+    getBreakpoints(uri?: URI): DebugBreakpoint[] {
+        if (uri) {
+            return this._breakpoints.get(uri.path.toString()) || [];
+        }
+        const result = [];
+        for (const breakpoints of this._breakpoints.values()) {
+            result.push(...breakpoints);
+        }
+        return result;
+    }
+    protected clearBreakpoints(): void {
+        const uris = [...this._breakpoints.keys()];
+        this._breakpoints.clear();
+        for (const uri of uris) {
+            this.fireDidChangeBreakpoints(new URI(uri));
         }
     }
-
-    private async launch(session: DebugSession, initializeArgs: DebugProtocol.InitializeRequestArguments): Promise<void> {
-        await session.initialize(initializeArgs);
-
-        const launchArgs: DebugProtocol.LaunchRequestArguments = Object.assign(session.configuration, { __restart: false, noDebug: false });
-        try {
-            await session.launch(launchArgs);
-        } catch (cause) {
-            this.onSessionInitializationFailed(session, cause as DebugProtocol.Response);
-            throw cause;
+    protected async updateBreakpoints(options: {
+        uri?: URI,
+        sourceModified: boolean
+    }): Promise<void> {
+        const { uri, sourceModified } = options;
+        for (const affectedUri of this.getAffectedUris(uri)) {
+            const path = affectedUri.path.toString();
+            const breakpoints = this.breakpoints.getBreakpoints({
+                uri: affectedUri,
+                enabled: true
+            });
+            const response = await this.sendRequest('setBreakpoints', {
+                source: { path },
+                sourceModified,
+                breakpoints: breakpoints.map(({ data }) => data.raw)
+            });
+            const result = response.body.breakpoints.map((raw, index) =>
+                new DebugBreakpoint({ raw, data: breakpoints[index].data }, this)
+            );
+            this._breakpoints.set(affectedUri.toString(), result);
+            this.fireDidChangeBreakpoints(affectedUri);
         }
     }
-
-    private async onSessionInitialized(session: DebugSession): Promise<void> {
-        await this.breakpointApplier.applySessionBreakpoints(session);
-        await session.configurationDone();
-    }
-
-    private async onSessionInitializationFailed(session: DebugSession, cause: DebugProtocol.Response): Promise<void> {
-        this.destroy(session.sessionId);
-        await this.notification.showMessage({
-            type: MessageType.Error,
-            text: cause.message || 'Debug session initialization failed. See console for details.',
-            options: {
-                timeout: 10000
-            }
-        });
-    }
-
-    /**
-     * Removes the [debug session](#DebugSession).
-     * @param sessionId The session identifier
-     */
-    remove(sessionId: string): void {
-        this.sessions.delete(sessionId);
-        if (this.activeDebugSessionId) {
-            if (this.activeDebugSessionId === sessionId) {
-                if (this.sessions.size !== 0) {
-                    this.setActiveDebugSession(this.sessions.keys().next().value);
-                } else {
-                    this.setActiveDebugSession(undefined);
-                }
-            }
-        }
-    }
-
-    /**
-     * Finds a debug session by its identifier.
-     * @returns The debug sessions
-     */
-    find(sessionId: string): DebugSession | undefined {
-        return this.sessions.get(sessionId);
-    }
-
-    /**
-     * Finds all instantiated debug sessions.
-     * @returns An array of debug sessions
-     */
-    findAll(): DebugSession[] {
-        return Array.from(this.sessions.values());
-    }
-
-    /**
-     * Sets the active debug session.
-     * @param sessionId The session identifier
-     */
-    setActiveDebugSession(sessionId: string | undefined) {
-        if (sessionId && this.find(sessionId) === undefined) {
-            return;
-        }
-
-        const oldActiveSessionSession = this.activeDebugSessionId ? this.find(this.activeDebugSessionId) : undefined;
-
-        if (this.activeDebugSessionId !== sessionId) {
-            this.activeDebugSessionId = sessionId;
-            this.onDidChangeActiveDebugSessionEmitter.fire([oldActiveSessionSession, this.getActiveDebugSession()]);
-        }
-    }
-
-    /**
-     * Returns the active debug session.
-     * @returns the [debug session](#DebugSession)
-     */
-    getActiveDebugSession(): DebugSession | undefined {
-        if (this.activeDebugSessionId) {
-            return this.sessions.get(this.activeDebugSessionId);
-        }
-    }
-
-    /**
-     * Destroy the debug session. If session identifier isn't provided then
-     * all active debug session will be destroyed.
-     * @param sessionId The session identifier
-     */
-    destroy(sessionId?: string): void {
-        if (sessionId) {
-            const session = this.sessions.get(sessionId);
-            if (session) {
-                this.doDestroy(session);
-            }
+    protected *getAffectedUris(uri?: URI): IterableIterator<URI> {
+        if (uri) {
+            yield uri;
         } else {
-            this.sessions.forEach(session => this.doDestroy(session));
+            for (const uriString of this.breakpoints.getUris()) {
+                yield new URI(uriString);
+            }
         }
     }
 
-    private doDestroy(session: DebugSession): void {
-        this.debugService.stop(session.sessionId);
-
-        session.dispose();
-        this.remove(session.sessionId);
-        this.onDidDestroyDebugSessionEmitter.fire(session);
-    }
-
-    get onDidChangeActiveDebugSession(): Event<[DebugSession | undefined, DebugSession | undefined]> {
-        return this.onDidChangeActiveDebugSessionEmitter.event;
-    }
-
-    get onDidPreCreateDebugSession(): Event<string> {
-        return this.onDidPreCreateDebugSessionEmitter.event;
-    }
-
-    get onDidCreateDebugSession(): Event<DebugSession> {
-        return this.onDidCreateDebugSessionEmitter.event;
-    }
-
-    get onDidDestroyDebugSession(): Event<DebugSession> {
-        return this.onDidDestroyDebugSessionEmitter.event;
-    }
-}
-
-/**
- * DAP resource.
- */
-export const DAP_SCHEME = 'dap';
-
-export class DebugResource implements Resource {
-
-    constructor(
-        public uri: URI,
-        protected readonly debugSessionManager: DebugSessionManager,
-    ) { }
-
-    dispose(): void { }
-
-    readContents(options: { encoding?: string }): Promise<string> {
-        const debugSession = this.debugSessionManager.getActiveDebugSession();
-        if (!debugSession) {
-            throw new Error(`There is no active debug session to load content '${this.uri}'`);
-        }
-
-        const sourceReference = this.uri.query;
-        if (sourceReference) {
-            return debugSession.source({ sourceReference: Number.parseInt(sourceReference) }).then(response => response.body.content);
-        }
-
-        const path = this.uri.path.toString();
-        const source = debugSession.state.sources.get(path);
-        if (!source) {
-            throw new Error(`There is no loaded source for '${this.uri}'`);
-        }
-
-        if (!source.sourceReference) {
-            throw new Error(`sourceReference isn't specified '${this.uri}'`);
-        }
-
-        return debugSession.source({ sourceReference: source.sourceReference }).then(response => response.body.content);
-    }
-}
-
-@injectable()
-export class DebugResourceResolver implements ResourceResolver {
-
-    constructor(
-        @inject(DebugSessionManager)
-        protected readonly debugSessionManager: DebugSessionManager
-    ) { }
-
-    resolve(uri: URI): DebugResource {
-        if (uri.scheme !== DAP_SCHEME) {
-            throw new Error('The given URI is not a valid dap uri: ' + uri);
-        }
-
-        return new DebugResource(uri, this.debugSessionManager);
-    }
 }

@@ -14,33 +14,9 @@
  * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
  ********************************************************************************/
 
-import { injectable, inject } from 'inversify';
-import { EditorManager, EditorOpenerOptions, Position } from '@theia/editor/lib/browser';
 import { DebugProtocol } from 'vscode-debugprotocol';
-import { EditorWidget } from '@theia/editor/lib/browser/editor-widget';
 import URI from '@theia/core/lib/common/uri';
 import { ExtDebugProtocol } from '../common/debug-common';
-import { DebugSession } from './debug-model';
-
-@injectable()
-export class SourceOpener {
-    constructor(@inject(EditorManager) protected readonly editorManager: EditorManager) { }
-
-    open(frame: DebugProtocol.StackFrame): Promise<EditorWidget> {
-        if (!frame.source) {
-            return Promise.reject(`The source '${frame.name}' to open is not specified.`);
-        }
-
-        const uri = DebugUtils.toUri(frame.source);
-        return this.editorManager.open(uri, this.toEditorOpenerOption(frame));
-    }
-
-    private toEditorOpenerOption(frame: DebugProtocol.StackFrame): EditorOpenerOptions {
-        return {
-            selection: { start: Position.create(frame.line - 1, frame.column - 1) }
-        };
-    }
-}
 
 export namespace DebugUtils {
     /**
@@ -130,37 +106,6 @@ export namespace DebugUtils {
         }
 
         throw new Error('Unrecognized source type: ' + JSON.stringify(source));
-    }
-
-    /**
-     * Converts the [uri](#URI) to [debug source](#DebugProtocol.Source).
-     * @param uri an [uri](#URI) referring to the source
-     * @param debugSession [debug session](#DebugSession)
-     * @returns an [debug source](#DebugProtocol.Source) referred by the uri
-     */
-    export function toSource(uri: URI, debugSession: DebugSession | undefined): DebugProtocol.Source {
-        const sourceReference = uri.query;
-
-        if (debugSession) {
-            const source = sourceReference
-                ? debugSession.state.sources.get(sourceReference)
-                : debugSession.state.sources.get(uri.path.toString());
-            if (source) {
-                return source;
-            }
-        }
-
-        if (sourceReference) {
-            return {
-                sourceReference: Number.parseInt(sourceReference),
-                name: uri.path.toString()
-            };
-        }
-
-        return {
-            name: uri.displayName,
-            path: uri.path.toString()
-        };
     }
 
     /**

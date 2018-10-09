@@ -15,10 +15,13 @@
  ********************************************************************************/
 
 .theia-debug-container {
-    display: inline-table;
+    display: flex;
+    flex-direction: column;
     color: var(--theia-ui-font-color1);
     background: var(--theia-layout-color0);
     font-size: var(--theia-ui-font-size1);
+    padding-top: var(--theia-ui-padding);
+    padding-left: var(--theia-ui-padding);
 }
 
 /* Common layout styles */
@@ -148,68 +151,39 @@ div[orientation='vertical'] > .theia-debug-entry > .theia-TreeContainer > div > 
     height: calc(100% - 20px);
 }
 
-/** Icons */
-
-.theia-debug-active-line {
-    background-color: rgba(255, 0, 0, 0.2);
-}
-
-.active-breakpoint,
-.inactive-breakpoint {
-    display: inline-flex;
-    justify-content: flex-end;
-    position:  relative !important;
-    text-align: right;
-}
-
-.active-breakpoint {
-    color: rgb(255, 0, 0);
-}
-
-.inactive-breakpoint {
-    color: var(--theia-ui-font-color2);
-}
-
 /** Miscellaneous */
 
-.debug-toolbar .button-container .btn {
-    width: 24px;
-    height: 24px;
-    display: inline-block;
-    align-items: center;
-    user-select: none;
-    border: var(--theia-border-width) solid transparent;
-    opacity: 0.25;
-    pointer-events: none;
+.debug-toolbar {
+    padding-bottom: calc(var(--theia-ui-padding)/2);
+    border-bottom: 1px solid var(--theia-layout-color4);
 }
 
-.debug-toolbar .button-container .btn.enabled {
+.debug-toolbar .debug-action {
+    padding: calc(var(--theia-ui-padding)/2);
     opacity: 0.7;
     cursor: pointer;
     pointer-events: all;
 }
 
-.debug-toolbar .button-container .btn.enabled:hover {
+.debug-toolbar .debug-action:not(:focus) {
+    border: 1px solid transparent;
+}
+
+.debug-toolbar .debug-action.theia-mod-disabled {
+    opacity: 0.25;
+    user-select: none;
+    pointer-events: none;
+}
+
+.debug-toolbar .debug-action.theia-mod-disabled:hover {
     opacity: 1;
-}
-
-.theia-debug-header {
-    background: var(--theia-layout-color3);
-    text-transform: uppercase;
-    font-size: var(--theia-ui-font-size0);
-    font-weight: 800;
-    border: 4px solid;
-    border-color: var(--theia-layout-color3);
-}
-
-.theia-debug-breakpoint-dialog .theia-debug-breakpoints {
-    background: var(--theia-layout-color0);
-    height: 380px
 }
 
 .debug-tab-icon::before {
     content: "\f188"
 }
+
+/** Console */
 
 .theia-debug-console-unavailable {
     font-style: italic;
@@ -243,4 +217,34 @@ div[orientation='vertical'] > .theia-debug-entry > .theia-TreeContainer > div > 
 
 .theia-debug-console-variable .name {
     color: var(--theia-variable-name-color);
+}
+
+/** Editor **/
+
+.monaco-editor .theia-debug-breakpoint-glyph {
+    background: url('breakpoint.svg') center center no-repeat;
+}
+
+.monaco-editor .theia-debug-breakpoint-disabled-glyph {
+    background: url('breakpoint-disabled.svg') center center no-repeat;
+}
+
+.monaco-editor .theia-debug-breakpoint-unverified-glyph {
+    background: url('breakpoint-unverified.svg') center center no-repeat;
+}
+
+.monaco-editor.vs-dark .theia-debug-breakpoint-glyph {
+    background: url('breakpoint-dark.svg') center center no-repeat;
+}
+
+.monaco-editor.vs-dark .theia-debug-breakpoint-disabled-glyph {
+    background: url('breakpoint-disabled-dark.svg') center center no-repeat;
+}
+
+.monaco-editor.vs-dark .theia-debug-breakpoint-unverified-glyph {
+    background: url('breakpoint-unverified-dark.svg') center center no-repeat;
+}
+
+.monaco-editor .theia-debug-breakpoint-hint-glyph {
+    background: url('breakpoint-hint.svg') center center no-repeat;
 }
